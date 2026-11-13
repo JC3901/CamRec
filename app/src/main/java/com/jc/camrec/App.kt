@@ -21,6 +21,10 @@ class App : Application(), ImageLoaderFactory {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_EVENTS, "Recording started / finished", NotificationManager.IMPORTANCE_DEFAULT)
         )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_LIVE, "Followed room is live", NotificationManager.IMPORTANCE_HIGH)
+                .apply { description = "Alerts when a room you follow comes online" }
+        )
         Recorder.recoverLeftovers()
     }
 
@@ -33,6 +37,7 @@ class App : Application(), ImageLoaderFactory {
     companion object {
         const val CHANNEL_RECORDING = "recording"
         const val CHANNEL_EVENTS = "events"
+        const val CHANNEL_LIVE = "live"
         lateinit var ctx: Context
             private set
     }

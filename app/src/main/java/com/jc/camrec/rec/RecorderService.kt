@@ -48,17 +48,18 @@ class RecorderService : Service() {
             ?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CamRec:record")?.apply { setReferenceCounted(false); acquire() }
 
         scope.launch {
-            combine(Recorder.active, Store.settings, Recorder.finalizing) { active, settings, finalizing ->
-                Triple(active, settings, finalizing)
-            }.collect { (active, settings, finalizing) ->
-                if (settings.monitor && monitorJob?.isActive != true) startMonitor()
-                if (!settings.monitor) { monitorJob?.cancel(); monitorJob = null }
-                if (active.isEmpty() && !settings.monitor && finalizing == 0) {
+            combine(Recorder.active, Store.settings, Recorder.finalizing, Store.follows) { active, settings, finalizing, follows ->
+                State(active.size, active.values.map { it.username }, settings.monitor && follows.isNotEmpty(), finalizing)
+            }.collect { st ->
+                val (recording, names, monitor, finalizing) = st
+                if (monitor && monitorJob?.isActive != true) startMonitor()
+                if (!monitor) { monitorJob?.cancel(); monitorJob = null }
+                if (recording == 0 && !monitor && finalizing == 0) {
                     stopSelf()
                 } else {
                     try {
                         NotificationManagerCompat.from(this@RecorderService)
-                            .notify(NOTIFICATION_ID, buildNotification(active.size, settings.monitor, finalizing, active.values.map { it.username }))
+                            .notify(NOTIFICATION_ID, buildNotification(recording, monitor, finalizing, names))
                     } catch (_: SecurityException) {}
                 }
             }
@@ -69,10 +70,12 @@ class RecorderService : Service() {
         monitorJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try { Recorder.checkFollows(autoStart = true) } catch (e: Exception) { Log.w("Monitor", "check failed", e) }
-                delay(Store.settings.value.pollSeconds.coerceAtLeast(20) * 1000L)
+                delay(Store.settings.value.pollSeconds.coerceAtLeast(15) * 1000L)
             }
         }
     }
+
+    private data class State(val recording: Int, val names: List<String>, val monitor: Boolean, val finalizing: Int)
 
     private fun goForeground(n: Notification) {
         if (Build.VERSION.SDK_INT >= 34) {
@@ -94,7 +97,7 @@ class RecorderService : Service() {
         }
         val text = when {
             names.isNotEmpty() -> names.joinToString(", ")
-            monitor -> "Auto-records followed rooms when they go live"
+            monitor -> "Alerts and records followed rooms when they go live"
             else -> ""
         }
         val b = NotificationCompat.Builder(this, App.CHANNEL_RECORDING)
@@ -140,10 +143,13 @@ class RecorderService : Service() {
     }
 }
 
-/** Restarts background monitoring after a reboot, if it was on. */
+/** Restarts background monitoring after a reboot or an app update, if it was on. */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED && Store.settings.value.monitor) {
+        val action = intent.action
+        if ((action == Intent.ACTION_BOOT_COMPLETED || action == Intent.ACTION_MY_PACKAGE_REPLACED) &&
+            Store.settings.value.monitor && Store.follows.value.isNotEmpty()
+        ) {
             RecorderService.ensureRunning(context)
         }
     }

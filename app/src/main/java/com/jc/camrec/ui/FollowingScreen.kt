@@ -101,7 +101,7 @@ fun FollowingScreen(nav: Nav) {
                         Column(Modifier.weight(1f)) {
                             Text("Background auto-record", fontWeight = FontWeight.SemiBold)
                             Text(
-                                if (settings.monitor) "Checking every ${settings.pollSeconds}s. Rooms with Auto on are recorded when they go live."
+                                if (settings.monitor) "Checking every ${settings.pollSeconds}s. You get an alert when a room goes live, and rooms with Auto on start recording straight away."
                                 else "Off. Turn on to record followed rooms automatically, even with the app closed.",
                                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )

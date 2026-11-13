@@ -39,6 +39,11 @@ sealed interface Screen {
     data class Browser(val url: String) : Screen
 }
 
+/** A room to open, set when the app is launched from a "live" notification. */
+object DeepLink {
+    val room = kotlinx.coroutines.flow.MutableStateFlow<Pair<String, String>?>(null)
+}
+
 /** Simple back-stack navigation shared by all screens. */
 class Nav {
     val stack = mutableStateListOf<Screen>(Screen.Tabs)
@@ -79,6 +84,17 @@ fun AppRoot() {
             dismissButton = { TextButton(onClick = { exitProcess(0) }) { Text("Leave") } },
         )
         return
+    }
+
+    val deepLink by DeepLink.room.collectAsState()
+    LaunchedEffect(deepLink) {
+        val (site, username) = deepLink ?: return@LaunchedEffect
+        DeepLink.room.value = null
+        val target = Screen.Watch(site, username)
+        if (nav.current != target) {
+            while (nav.stack.size > 1) nav.pop()
+            nav.push(target)
+        }
     }
 
     BackHandler(enabled = nav.stack.size > 1) { nav.pop() }

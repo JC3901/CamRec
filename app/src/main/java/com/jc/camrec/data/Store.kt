@@ -24,8 +24,8 @@ data class Follow(
 
 data class Settings(
     /** Watch followed rooms in the background and record them when they go live. */
-    val monitor: Boolean = false,
-    val pollSeconds: Int = 60,
+    val monitor: Boolean = true,
+    val pollSeconds: Int = 30,
     /** 0 = best available. */
     val maxHeight: Int = 0,
     /** Keep waiting this long for a room that dropped out, so short breaks end up in one video. */
@@ -34,6 +34,8 @@ data class Settings(
     /** Split long recordings into files of at most this many minutes (0 = never). */
     val splitMinutes: Int = 0,
     val notifyOnStart: Boolean = true,
+    /** Heads-up notification when a followed room goes live. */
+    val notifyOnLive: Boolean = true,
     val adultConfirmed: Boolean = false,
 )
 
@@ -57,6 +59,7 @@ object Store {
             wifiOnly = prefs.getBoolean("wifiOnly", d.wifiOnly),
             splitMinutes = prefs.getInt("splitMinutes", d.splitMinutes),
             notifyOnStart = prefs.getBoolean("notifyOnStart", d.notifyOnStart),
+            notifyOnLive = prefs.getBoolean("notifyOnLive", d.notifyOnLive),
             adultConfirmed = prefs.getBoolean("adultConfirmed", d.adultConfirmed),
         )
     }
@@ -71,6 +74,7 @@ object Store {
             .putBoolean("wifiOnly", s.wifiOnly)
             .putInt("splitMinutes", s.splitMinutes)
             .putBoolean("notifyOnStart", s.notifyOnStart)
+            .putBoolean("notifyOnLive", s.notifyOnLive)
             .putBoolean("adultConfirmed", s.adultConfirmed)
             .apply()
         _settings.value = s
@@ -101,6 +105,7 @@ object Store {
         val list = _follows.value
         if (list.any { it.key == Follow.key(site, username) }) return
         saveFollows(list + Follow(site, username))
+        if (settings.value.monitor) com.jc.camrec.rec.RecorderService.ensureRunning(App.ctx)
     }
 
     fun unfollow(key: String) = saveFollows(_follows.value.filterNot { it.key == key })

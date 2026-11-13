@@ -24,7 +24,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -77,21 +82,27 @@ object Recorder {
     private fun setState(key: String, change: (ActiveRecording) -> ActiveRecording) =
         _active.update { m -> m[key]?.let { m + (key to change(it)) } ?: m }
 
-    fun start(site: Site, username: String, auto: Boolean = false) {
+    /** [initial] is a status that was just fetched, so the recording can begin without asking the site again. */
+    fun start(site: Site, username: String, auto: Boolean = false, initial: RoomStatus? = null) {
         val key = Follow.key(site.id, username)
         if (jobs.containsKey(key)) return
+        stoppedByUser.remove(key)
         val stop = AtomicBoolean(false)
         stopFlags[key] = stop
         val startedAt = System.currentTimeMillis()
         _active.update { it + (key to ActiveRecording(key, site.id, username, startedAt, auto = auto)) }
         RecorderService.ensureRunning(App.ctx)
         val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            var failed = false
             try {
-                record(site, username, key, startedAt, stop)
+                record(site, username, key, startedAt, stop, auto, initial)
             } catch (e: Exception) {
                 Log.w(TAG, "Recording $key failed", e)
-                events.value = "$username: ${e.message ?: e.javaClass.simpleName}"
+                val reason = e.message ?: e.javaClass.simpleName
+                events.value = "$username: $reason"
+                if (auto && Store.settings.value.notifyOnLive) { LiveAlerts.failed(site, username, reason); failed = true }
             } finally {
+                if (!failed) LiveAlerts.cancel(key)
                 jobs.remove(key)
                 stopFlags.remove(key)
                 _active.update { it - key }
@@ -101,7 +112,11 @@ object Recorder {
         job.start()
     }
 
+    /** Rooms the user stopped by hand: not auto-recorded again until they go offline. */
+    private val stoppedByUser = ConcurrentHashMap.newKeySet<String>()
+
     fun stop(key: String) {
+        if (stopFlags.containsKey(key)) stoppedByUser.add(key)
         stopFlags[key]?.set(true)
         setState(key) { it.copy(state = "Saving…") }
     }
@@ -113,7 +128,10 @@ object Recorder {
         while (left > 0 && !stop.get()) { delay(minOf(left, 1000)); left -= 1000 }
     }
 
-    private suspend fun record(site: Site, username: String, key: String, startedAt: Long, stop: AtomicBoolean) {
+    private suspend fun record(
+        site: Site, username: String, key: String, startedAt: Long, stop: AtomicBoolean,
+        auto: Boolean, initial: RoomStatus?,
+    ) {
         val dir = File(Library.partsRoot, "${site.id}_${username}_$startedAt").apply { mkdirs() }
         File(dir, "meta.json").writeText(
             JSONObject().put("site", site.id).put("username", username).put("startedAt", startedAt).toString()
@@ -122,10 +140,12 @@ object Recorder {
         var groupStart = startedAt
         var index = 0
         var lastData = System.currentTimeMillis()
-        var notified = false
+        // Automatic recordings already announced themselves with a "live" notification.
+        var notified = auto
+        var prefetched = initial
         try {
             while (!stop.get()) {
-                val status = try { site.status(username) } catch (e: Exception) {
+                val status = prefetched?.also { prefetched = null } ?: try { site.status(username) } catch (e: Exception) {
                     if (index == 0) throw e
                     null
                 }
@@ -238,23 +258,47 @@ object Recorder {
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
-    /** Checks every followed room once; starts auto-recordings when [autoStart] is set. */
+    /** Whether the background monitor last saw each followed room live; used to alert only when a room comes online. */
+    private val monitorSawOnline = ConcurrentHashMap<String, Boolean>()
+    private val checkPermits = Semaphore(4)
+
+    /**
+     * Checks every followed room once (a few at a time, so a long list is still quick).
+     * With [autoStart] (the background monitor), rooms that are live get recorded straight away and a
+     * "live" notification goes out when a followed room comes online.
+     */
     suspend fun checkFollows(autoStart: Boolean) = checkLock.withLock {
-        for (f in Store.follows.value) {
-            if (isRecording(f.key)) continue
-            val site = Site.byId(f.site)
-            val checked = try {
-                CheckedStatus(site.status(f.username), null, System.currentTimeMillis())
-            } catch (e: Exception) {
-                CheckedStatus(null, e.message ?: e.javaClass.simpleName, System.currentTimeMillis())
-            }
-            _statuses.update { it + (f.key to checked) }
-            val s = Store.settings.value
-            if (autoStart && f.autoRecord && checked.status?.online == true && (!s.wifiOnly || isUnmetered())) {
-                start(site, f.username, auto = true)
-            }
+        coroutineScope {
+            Store.follows.value.map { f -> async(Dispatchers.IO) { checkPermits.withPermit { checkOne(f, autoStart) } } }.awaitAll()
+        }
+        Unit
+    }
+
+    private fun checkOne(f: Follow, autoStart: Boolean) {
+        if (isRecording(f.key)) { if (autoStart) monitorSawOnline[f.key] = true; return }
+        val site = Site.byId(f.site)
+        val checked = try {
+            CheckedStatus(site.status(f.username), null, System.currentTimeMillis())
+        } catch (e: Exception) {
+            CheckedStatus(null, e.message ?: e.javaClass.simpleName, System.currentTimeMillis())
+        }
+        _statuses.update { it + (f.key to checked) }
+        if (!autoStart) return
+        val status = checked.status ?: return  // network error: keep the last known state
+        val wasOnline = monitorSawOnline.put(f.key, status.online) == true
+        if (!status.online) { stoppedByUser.remove(f.key); return }
+        if (isRecording(f.key) || f.key in stoppedByUser) return
+
+        val s = Store.settings.value
+        val metered = s.wifiOnly && !isUnmetered()
+        if (f.autoRecord && !metered) {
+            start(site, f.username, auto = true, initial = status)
+            if (s.notifyOnLive) LiveAlerts.recording(site, f.username)
+        } else if (!wasOnline && s.notifyOnLive) {
+            LiveAlerts.live(site, f.username, if (f.autoRecord) "Not recording: Wi-Fi only is on" else null)
         }
     }
+
 
     private var notificationId = 1000
 

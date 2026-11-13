@@ -54,11 +54,14 @@ fun SettingsScreen(nav: Nav) {
             Store.updateSettings { it.copy(monitor = on) }
             if (on) RecorderService.ensureRunning(App.ctx)
         }
-        Choice("Check followed rooms every", s.pollSeconds, listOf(30 to "30 s", 60 to "1 min", 120 to "2 min", 300 to "5 min")) { v ->
+        Choice("Check followed rooms every", s.pollSeconds, listOf(15 to "15 s", 30 to "30 s", 60 to "1 min", 120 to "2 min", 300 to "5 min")) { v ->
             Store.updateSettings { it.copy(pollSeconds = v) }
         }
         Toggle("Wi-Fi only", "Only start automatic recordings on unmetered networks.", s.wifiOnly) { on -> Store.updateSettings { it.copy(wifiOnly = on) } }
-        Toggle("Notify when a recording starts", null, s.notifyOnStart) { on -> Store.updateSettings { it.copy(notifyOnStart = on) } }
+        Toggle("Notify when a followed room goes live", "Shows an alert with Watch and Stop buttons as soon as the room comes online.", s.notifyOnLive) { on ->
+            Store.updateSettings { it.copy(notifyOnLive = on) }
+        }
+        Toggle("Notify when I start a recording", null, s.notifyOnStart) { on -> Store.updateSettings { it.copy(notifyOnStart = on) } }
 
         Section("Recording")
         Choice("Maximum quality", s.maxHeight, listOf(0 to "Best", 1080 to "1080p", 720 to "720p", 480 to "480p")) { v ->
