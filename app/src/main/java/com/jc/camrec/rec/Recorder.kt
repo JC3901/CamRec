@@ -42,6 +42,7 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 data class ActiveRecording(
     val key: String,
@@ -123,6 +124,20 @@ object Recorder {
 
     fun stopAll() = active.value.keys.forEach { stop(it) }
 
+    /** Longest a recording stays paused for a paid show before it is saved and ended. */
+    private const val MAX_PAUSE_MS = 4 * 60 * 60_000L
+
+    /**
+     * Paid shows hide the public stream for a while, then the room comes back. Returns a label for
+     * these states (Chaturbate "hidden" and Stripchat "groupShow" are ticket shows), or null.
+     */
+    fun paidShow(state: String?): String? = when (state?.lowercase()) {
+        "hidden", "groupshow" -> "ticket show"
+        "group" -> "group show"
+        "private", "p2p", "virtualprivate" -> "private show"
+        else -> null
+    }
+
     private suspend fun waitOrStop(ms: Long, stop: AtomicBoolean) {
         var left = ms
         while (left > 0 && !stop.get()) { delay(minOf(left, 1000)); left -= 1000 }
@@ -140,6 +155,7 @@ object Recorder {
         var groupStart = startedAt
         var index = 0
         var lastData = System.currentTimeMillis()
+        var pausedSince: Long? = null
         // Automatic recordings already announced themselves with a "live" notification.
         var notified = auto
         var prefetched = initial
@@ -156,6 +172,16 @@ object Recorder {
                         events.value = "$username is not live right now (${status?.state ?: "unknown"})"
                         break
                     }
+                    val show = paidShow(status?.state)
+                    if (show != null || (pausedSince != null && status == null)) {
+                        // Paid show: pause, and carry on in the same video when it ends.
+                        val since = pausedSince ?: System.currentTimeMillis().also { pausedSince = it }
+                        if (System.currentTimeMillis() - since >= MAX_PAUSE_MS) break
+                        setState(key) { it.copy(state = "Paused – ${show ?: "show"} in progress") }
+                        waitOrStop(15_000, stop)
+                        continue
+                    }
+                    if (pausedSince != null) { pausedSince = null; lastData = System.currentTimeMillis() }
                     val gapMs = Store.settings.value.mergeGapMinutes * 60_000L
                     if (System.currentTimeMillis() - lastData >= gapMs) break
                     setState(key) { it.copy(state = "Room is ${status?.state ?: "unreachable"} – waiting for it to return") }
@@ -163,6 +189,7 @@ object Recorder {
                     continue
                 }
 
+                if (pausedSince != null) { pausedSince = null; lastData = System.currentTimeMillis() }
                 val settings = Store.settings.value
                 val selection = Hls.select(hls, site.streamHeaders, settings.maxHeight, status?.urlParams ?: emptyMap())
                 val part = PartFiles(dir, ++index)
@@ -170,12 +197,28 @@ object Recorder {
                 if (!notified && settings.notifyOnStart) { notify("Recording $username", site.name); notified = true }
 
                 val splitAt = if (settings.splitMinutes > 0) groupStart + settings.splitMinutes * 60_000L else null
-                val reason = Capture(selection, site.streamHeaders, part, stop, splitAt) { n ->
-                    setState(key) { it.copy(bytes = it.bytes + n) }
-                }.run()
+                // Ends this part when the user stops, or as soon as a paid show starts.
+                val partStop = AtomicBoolean(false)
+                val showStarted = AtomicReference<String?>(null)
+                val watcher = scope.launch { watchForShow(site, username, key, stop, partStop, showStarted) }
+                val reason = try {
+                    Capture(selection, site.streamHeaders, part, partStop, splitAt) { n ->
+                        setState(key) { it.copy(bytes = it.bytes + n) }
+                    }.run()
+                } finally {
+                    partStop.set(true); watcher.cancel()
+                }
                 Log.i(TAG, "$key part $index ended: $reason")
 
                 if (part.hasData()) { group.add(part); lastData = System.currentTimeMillis() } else part.delete()
+                if (stop.get()) break
+                val show = showStarted.get()
+                if (show != null) {
+                    pausedSince = System.currentTimeMillis()
+                    setState(key) { it.copy(state = "Paused – $show in progress") }
+                    waitOrStop(15_000, stop)
+                    continue
+                }
                 if (reason == EndReason.STOPPED) break
                 if (reason == EndReason.SPLIT) {
                     val done = group
@@ -189,6 +232,27 @@ object Recorder {
             withContext(NonCancellable) {
                 setState(key) { it.copy(state = "Saving…") }
                 finalize(site.id, username, groupStart, group, dir)
+            }
+        }
+    }
+
+    /** While a part is being captured, checks the room now and then so a paid show pauses the recording quickly. */
+    private suspend fun watchForShow(
+        site: Site, username: String, key: String,
+        stop: AtomicBoolean, partStop: AtomicBoolean, showStarted: AtomicReference<String?>,
+    ) {
+        var nextCheck = System.currentTimeMillis() + 20_000
+        while (!partStop.get()) {
+            if (stop.get()) { partStop.set(true); return }
+            delay(1000)
+            if (System.currentTimeMillis() < nextCheck) continue
+            nextCheck = System.currentTimeMillis() + 20_000
+            val status = try { site.status(username) } catch (_: Exception) { null } ?: continue
+            _statuses.update { it + (key to CheckedStatus(status, null, System.currentTimeMillis())) }
+            paidShow(status.state)?.let { show ->
+                Log.i(TAG, "$key: $show started, pausing")
+                showStarted.set(show)
+                partStop.set(true)
             }
         }
     }

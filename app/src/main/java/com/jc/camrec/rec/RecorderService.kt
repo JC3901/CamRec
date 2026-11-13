@@ -49,7 +49,7 @@ class RecorderService : Service() {
 
         scope.launch {
             combine(Recorder.active, Store.settings, Recorder.finalizing, Store.follows) { active, settings, finalizing, follows ->
-                State(active.size, active.values.map { it.username }, settings.monitor && follows.isNotEmpty(), finalizing)
+                State(active.size, active.values.map { if (it.state.startsWith("Paused")) "${it.username} (paused)" else it.username }, settings.monitor && follows.isNotEmpty(), finalizing)
             }.collect { st ->
                 val (recording, names, monitor, finalizing) = st
                 if (monitor && monitorJob?.isActive != true) startMonitor()
